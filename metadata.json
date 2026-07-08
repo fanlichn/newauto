@@ -1,0 +1,6 @@
+{
+  "name": "Auto.js Web Studio",
+  "description": "High-fidelity interactive playground for Auto.js containing file explorer, documentation reader, and browser-based JavaScript automation simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
