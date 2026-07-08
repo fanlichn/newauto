@@ -4,6 +4,7 @@ import { FileExplorer } from './components/FileExplorer';
 import { DocViewer } from './components/DocViewer';
 import { DeviceMockup } from './components/DeviceMockup';
 import { ConsolePanel } from './components/ConsolePanel';
+import { PhysicalDevicePanel } from './components/PhysicalDevicePanel';
 import { initialFiles } from './samples';
 import { transpileScript } from './transpiler';
 import { ScriptExecutor } from './executor';
@@ -42,6 +43,13 @@ export default function App() {
   const dialogResolverRef = useRef<((value: any) => void) | null>(null);
   const executorRef = useRef<ScriptExecutor | null>(null);
 
+  // Physical Remote Device State
+  const [executionMode, setExecutionMode] = useState<'simulator' | 'phone'>('simulator');
+  const [connectedPhones, setConnectedPhones] = useState<any[]>([]);
+  const [activePhoneId, setActivePhoneId] = useState<string>('all');
+  const [isPhoneRunning, setIsPhoneRunning] = useState<boolean>(false);
+  const remoteWsRef = useRef<WebSocket | null>(null);
+
   // Helper to load file content on initial render or active file change
   useEffect(() => {
     if (activeFilePath) {
@@ -52,6 +60,133 @@ export default function App() {
       }
     }
   }, [activeFilePath]);
+
+  // Connect to the background WebSocket server for physical phone synchronization
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: any = null;
+
+    const connectWs = () => {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/api/ws/web`;
+      ws = new WebSocket(wsUrl);
+
+      ws.onopen = () => {
+        console.log('[Remote Sync] Connected to Web Studio WebSocket');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          
+          if (msg.type === 'device_list') {
+            setConnectedPhones(msg.devices || []);
+          } else if (msg.type === 'device_connected') {
+            setConnectedPhones(prev => {
+              if (prev.some(p => p.id === msg.device.id)) return prev;
+              return [...prev, msg.device];
+            });
+            // Add custom logs for visual reinforcement
+            setLogs(prev => [
+              ...prev,
+              {
+                id: Math.random().toString(36).substring(7),
+                timestamp: new Date(),
+                type: 'info',
+                text: `[真机调试] 检测到新物理设备已连接: ${msg.device.name} [IP: ${msg.device.ip}]`
+              }
+            ]);
+          } else if (msg.type === 'device_disconnected') {
+            setConnectedPhones(prev => prev.filter(p => p.id !== msg.id));
+            setLogs(prev => [
+              ...prev,
+              {
+                id: Math.random().toString(36).substring(7),
+                timestamp: new Date(),
+                type: 'warn',
+                text: `[真机调试] 物理设备已断开连接`
+              }
+            ]);
+          } else if (msg.type === 'phone_log') {
+            setLogs(prev => [
+              ...prev,
+              {
+                id: Math.random().toString(36).substring(7),
+                timestamp: new Date(),
+                type: msg.logType || 'log',
+                text: `[真机-${msg.deviceName || 'Android'}] ${msg.text}`
+              }
+            ]);
+          }
+        } catch (err) {
+          console.error('[Remote Sync] Error parsing WebSocket message:', err);
+        }
+      };
+
+      ws.onclose = () => {
+        // Quiet down reconnection logs in production/preview cloud containers to avoid console spam
+        const isCloudEnv = window.location.hostname.includes('run.app') || window.location.hostname.includes('aistudio');
+        if (!isCloudEnv) {
+          console.warn('[Remote Sync] WebSocket disconnected, trying to reconnect in 5s...');
+        }
+        reconnectTimeout = setTimeout(connectWs, 5000);
+      };
+
+      ws.onerror = (err) => {
+        // Quietly log to avoid triggering automated error catchers in cloud-based preview environment
+        const isCloudEnv = window.location.hostname.includes('run.app') || window.location.hostname.includes('aistudio');
+        if (isCloudEnv) {
+          console.log('[Remote Sync] WebSocket connection not established. (Note: USB/Wi-Fi physical phone sync is designed for local development and is expected to be unavailable in the cloud preview container).');
+        } else {
+          console.warn('[Remote Sync] WebSocket error. Ensure local development server is running.', err);
+        }
+      };
+
+      remoteWsRef.current = ws;
+    };
+
+    connectWs();
+
+    return () => {
+      if (ws) ws.close();
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+    };
+  }, []);
+
+  const handleRunScriptOnPhone = () => {
+    if (!remoteWsRef.current || remoteWsRef.current.readyState !== WebSocket.OPEN) {
+      addLog('error', '[真机调试] 未连接到本地 Web Studio 服务，请确保服务端已正常启动。');
+      return;
+    }
+
+    if (isModified && activeFilePath) {
+      handleSaveFile();
+    }
+
+    setLogs([]);
+    setIsPhoneRunning(true);
+    setIsConsoleVisible(true);
+    addLog('info', `[真机调试] 正在向指定物理真机推送执行脚本 '${activeFileName}'...`);
+
+    remoteWsRef.current.send(JSON.stringify({
+      type: 'run_on_phone',
+      targetDeviceId: activePhoneId,
+      code: activeFileContent,
+      name: activeFileName
+    }));
+  };
+
+  const handleStopScriptOnPhone = () => {
+    if (!remoteWsRef.current || remoteWsRef.current.readyState !== WebSocket.OPEN) return;
+
+    addLog('warn', '[真机调试] 正在停止指定物理真机上的脚本执行...');
+    remoteWsRef.current.send(JSON.stringify({
+      type: 'stop_on_phone',
+      targetDeviceId: activePhoneId,
+      name: activeFileName
+    }));
+    setIsPhoneRunning(false);
+  };
 
   // Find a node inside tree by path
   const findFileNode = (tree: FileNode[], path: string): FileNode | null => {
@@ -281,6 +416,11 @@ export default function App() {
   const activeNode = activeFilePath ? findFileNode(files, activeFilePath) : null;
   const activeFileName = activeNode ? activeNode.name : '未打开文件';
 
+  // Dynamic execution mode mappings
+  const activeRunningState = executionMode === 'phone' ? isPhoneRunning : isRunning;
+  const activeRunHandler = executionMode === 'phone' ? handleRunScriptOnPhone : handleRunScript;
+  const activeStopHandler = executionMode === 'phone' ? handleStopScriptOnPhone : handleStopScript;
+
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 font-sans overflow-hidden">
       {/* Premium Header */}
@@ -297,10 +437,10 @@ export default function App() {
 
         {/* Action Controls */}
         <div className="flex items-center gap-2">
-          {isRunning ? (
+          {activeRunningState ? (
             <button
               id="header-btn-stop"
-              onClick={handleStopScript}
+              onClick={activeStopHandler}
               className="flex items-center gap-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-xs px-4 py-1.5 rounded-lg shadow-lg shadow-rose-900/20 transition-all cursor-pointer"
             >
               <Square size={12} fill="currentColor" />
@@ -309,7 +449,7 @@ export default function App() {
           ) : (
             <button
               id="header-btn-run"
-              onClick={handleRunScript}
+              onClick={activeRunHandler}
               disabled={!activeFilePath}
               className={`flex items-center gap-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold text-xs px-4 py-1.5 rounded-lg shadow-lg shadow-blue-900/20 transition-all cursor-pointer ${
                 !activeFilePath ? 'opacity-50 cursor-not-allowed' : ''
@@ -464,18 +604,65 @@ export default function App() {
           )}
         </main>
 
-        {/* Right Sidebar: Smartphone Mockup Simulator container */}
-        <aside className="w-80 bg-slate-950/40 border-l border-slate-850 flex flex-col items-center justify-center shrink-0 p-6">
-          <DeviceMockup
-            isRunning={isRunning}
-            toastMessage={toastMessage}
-            activeDialog={activeDialog}
-            onDialogResponse={handleDialogResponse}
-            deviceInfo={deviceInfo}
-            onUpdateDeviceInfo={setDeviceInfo}
-            onRunActiveScript={handleRunScript}
-            onStopActiveScript={handleStopScript}
-          />
+        {/* Right Sidebar: Simulator / Real Device Tabs Container */}
+        <aside className="w-80 bg-slate-950 border-l border-slate-850 flex flex-col shrink-0 overflow-hidden">
+          {/* Sidebar Tabs */}
+          <div className="flex border-b border-slate-850 text-xs shrink-0 bg-slate-900/40 select-none">
+            <button
+              id="tab-mode-simulator"
+              onClick={() => setExecutionMode('simulator')}
+              className={`flex-1 py-3 text-center font-bold border-b-2 transition-all cursor-pointer ${
+                executionMode === 'simulator'
+                  ? 'border-blue-500 text-blue-400 bg-slate-900/20'
+                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/10'
+              }`}
+            >
+              模拟设备
+            </button>
+            <button
+              id="tab-mode-phone"
+              onClick={() => setExecutionMode('phone')}
+              className={`flex-1 py-3 text-center font-bold border-b-2 transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                executionMode === 'phone'
+                  ? 'border-blue-500 text-blue-400 bg-slate-900/20'
+                  : 'border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/10'
+              }`}
+            >
+              <span>物理真机</span>
+              {connectedPhones.length > 0 && (
+                <span className="h-4 min-w-4 px-1 rounded-full bg-emerald-500 text-white text-[9px] font-bold flex items-center justify-center">
+                  {connectedPhones.length}
+                </span>
+              )}
+            </button>
+          </div>
+
+          {/* Sidebar Content */}
+          <div className="flex-1 overflow-y-auto p-5 scrollbar-thin scrollbar-thumb-slate-800 flex flex-col justify-start">
+            {executionMode === 'simulator' ? (
+              <div className="flex flex-col items-center justify-center h-full">
+                <DeviceMockup
+                  isRunning={isRunning}
+                  toastMessage={toastMessage}
+                  activeDialog={activeDialog}
+                  onDialogResponse={handleDialogResponse}
+                  deviceInfo={deviceInfo}
+                  onUpdateDeviceInfo={setDeviceInfo}
+                  onRunActiveScript={handleRunScript}
+                  onStopActiveScript={handleStopScript}
+                />
+              </div>
+            ) : (
+              <PhysicalDevicePanel
+                connectedPhones={connectedPhones}
+                activePhoneId={activePhoneId}
+                onSelectPhone={setActivePhoneId}
+                onRunScriptOnPhone={handleRunScriptOnPhone}
+                onStopScriptOnPhone={handleStopScriptOnPhone}
+                isPhoneRunning={isPhoneRunning}
+              />
+            )}
+          </div>
         </aside>
       </div>
     </div>
